@@ -44,15 +44,16 @@ def frame_count(signal_length: int, config: StftConfig) -> int:
     return int(np.ceil((signal_length - config.frame_size) / config.hop_size)) + 1
 
 
-def stft(signal: np.ndarray, config: StftConfig) -> tuple[np.ndarray, int]:
-    """Analyze a mono signal into one real-FFT spectrum per frame.
+def _analysis_frames(signal: np.ndarray, config: StftConfig) -> tuple[np.ndarray, int]:
+    """Slice a mono signal into padded, windowed analysis frames.
 
-    The spectrum is complex. `abs(spectrum)` is the magnitude; `angle(spectrum)`
-    is its phase, which carries timing information and must be preserved.
+    Shared by `stft` (which FFTs these frames) and the LPC formant tools
+    further down (which need the time-domain frames themselves, not their
+    spectra, to estimate an all-pole envelope).
     """
     signal = np.asarray(signal, dtype=np.float64)
     if signal.ndim != 1:
-        raise ValueError("stft expects a one-dimensional (mono) signal")
+        raise ValueError("expects a one-dimensional (mono) signal")
 
     # The Hann window is zero at its ends.  Padding both sides ensures every
     # real input sample, including the first and last, is covered by interior
@@ -63,13 +64,24 @@ def stft(signal: np.ndarray, config: StftConfig) -> tuple[np.ndarray, int]:
     padded_length = (frames - 1) * config.hop_size + config.frame_size
     padded = np.pad(analysis_signal, (0, padded_length - len(analysis_signal)))
     window = sqrt_hann(config.frame_size)
-    spectra = np.empty((frames, config.frame_size // 2 + 1), dtype=np.complex128)
+    framed = np.empty((frames, config.frame_size))
 
     for index in range(frames):
         start = index * config.hop_size
-        # Replace np.fft.rfft here with your own real-FFT adapter if desired.
-        spectra[index] = np.fft.rfft(padded[start : start + config.frame_size] * window)
-    return spectra, len(signal)
+        framed[index] = padded[start : start + config.frame_size] * window
+    return framed, len(signal)
+
+
+def stft(signal: np.ndarray, config: StftConfig) -> tuple[np.ndarray, int]:
+    """Analyze a mono signal into one real-FFT spectrum per frame.
+
+    The spectrum is complex. `abs(spectrum)` is the magnitude; `angle(spectrum)`
+    is its phase, which carries timing information and must be preserved.
+    """
+    framed, original_length = _analysis_frames(signal, config)
+    # Replace np.fft.rfft here with your own real-FFT adapter if desired.
+    spectra = np.fft.rfft(framed, axis=1)
+    return spectra, original_length
 
 
 def istft(
@@ -266,18 +278,23 @@ def pitch_shift(
 
 
 def anonymize_voice(
-    signal: np.ndarray, semitones: float = 4.0, config: StftConfig = StftConfig()
+    signal: np.ndarray,
+    semitones: float = 4.0,
+    config: StftConfig = StftConfig(),
+    *,
+    formant_ratio: float = 1.0,
 ) -> np.ndarray:
     """A transparent, duration-preserving voice-transformation preset.
 
-    It intentionally exposes the pitch offset rather than presenting a fixed
-    transformation as "anonymous."  A pitch shift alters vocal pitch and, in
-    this simple approach, resonant vocal-tract characteristics too.  It cannot
-    remove identity cues such as wording, accent, speech rhythm, or context.
+    It intentionally exposes the pitch offset (and, now, the formant ratio)
+    rather than presenting a fixed transformation as "anonymous." `semitones`
+    changes vocal pitch; `formant_ratio` independently changes how large the
+    vocal tract sounds (see `shift_voice_character`). Neither can remove
+    identity cues such as wording, accent, speech rhythm, or context.
     """
-    if semitones == 0:
-        raise ValueError("anonymization needs a non-zero semitone offset")
-    return pitch_shift(signal, semitones, config, phase_locking=True)
+    if semitones == 0 and abs(formant_ratio - 1.0) < 1e-6:
+        raise ValueError("anonymization needs a non-zero semitone offset or formant ratio")
+    return shift_voice_character(signal, semitones, formant_ratio, config, phase_locking=True)
 
 
 def reduce_background_estimate(
@@ -297,6 +314,128 @@ def reduce_background_estimate(
     background_floor = np.percentile(magnitude, 20, axis=0, keepdims=True)
     gain = np.clip((magnitude - strength * background_floor) / (magnitude + 1e-12), 0.08, 1.0)
     return istft(spectra * gain, original_length, config)
+
+
+def _levinson_durbin(autocorrelation: np.ndarray, order: int) -> tuple[np.ndarray, float]:
+    """Solve the Yule-Walker equations for an all-pole (LPC) model.
+
+    Returns `(coefficients, error_power)` such that the all-pole filter is
+    `A(z) = 1 + coefficients[0]*z^-1 + ... + coefficients[order-1]*z^-order`,
+    and `error_power` is the leftover (unpredicted) energy — the gain that
+    `1 / A(z)` needs to reproduce the frame's overall loudness.
+    """
+    a = np.zeros(order + 1)
+    a[0] = 1.0
+    error = float(autocorrelation[0])
+    if error <= 1e-12:
+        return np.zeros(order), 1e-12
+    for i in range(1, order + 1):
+        acc = autocorrelation[i] + np.dot(a[1:i], autocorrelation[i - 1 : 0 : -1])
+        reflection = -acc / error
+        updated = a.copy()
+        updated[1:i] = a[1:i] + reflection * a[i - 1 : 0 : -1]
+        updated[i] = reflection
+        a = updated
+        error *= 1 - reflection**2
+        if error <= 1e-12:
+            error = 1e-12
+            break
+    return a[1:], error
+
+
+def default_lpc_order(sample_rate: int) -> int:
+    """A common rule of thumb for speech: roughly two poles per kHz, plus a few."""
+    return 2 + sample_rate // 1000
+
+
+def lpc_envelope(frame: np.ndarray, order: int, fft_size: int) -> np.ndarray:
+    """Estimate a smooth spectral envelope for one time-domain frame.
+
+    Fits an all-pole filter to the frame's autocorrelation (Levinson-Durbin),
+    then evaluates `sqrt(error) / |A(e^jw)|` at `fft_size // 2 + 1`
+    frequencies. This is the classic, lightweight way to describe "what the
+    vocal tract is doing" (the formants) separately from the finer harmonic
+    detail that carries pitch — the frame is assumed already windowed, so no
+    extra tapering is applied here.
+    """
+    frame = np.asarray(frame, dtype=np.float64)
+    autocorrelation = np.correlate(frame, frame, mode="full")[len(frame) - 1 :][: order + 1]
+    coefficients, error = _levinson_durbin(autocorrelation, order)
+    polynomial = np.concatenate(([1.0], coefficients))
+    response = np.fft.rfft(polynomial, n=fft_size)
+    return np.sqrt(error) / np.maximum(np.abs(response), 1e-9)
+
+
+def formant_shift(
+    signal: np.ndarray,
+    ratio: float,
+    config: StftConfig = StftConfig(),
+    *,
+    lpc_order: int | None = None,
+) -> np.ndarray:
+    """Move formant (vocal-tract resonance) frequencies without touching pitch.
+
+    `ratio > 1` raises the formants (reads as a smaller/younger vocal tract);
+    `ratio < 1` lowers them (bigger/older). Each frame's spectrum is divided
+    by its own LPC envelope to get a flattened "residual" that carries the
+    pitch harmonics and fine detail, the envelope is warped along the
+    frequency axis, and the residual is multiplied back in — so the
+    excitation (and therefore the pitch) is left alone.
+    """
+    if ratio <= 0:
+        raise ValueError("ratio must be positive")
+    if abs(ratio - 1.0) < 1e-6:
+        return np.asarray(signal, dtype=np.float64).copy()
+
+    order = lpc_order or default_lpc_order(config.sample_rate)
+    frames, original_length = _analysis_frames(signal, config)
+    spectra = np.fft.rfft(frames, axis=1)
+    bins = spectra.shape[1]
+    bin_index = np.arange(bins, dtype=np.float64)
+    warped = np.empty_like(spectra)
+
+    for i, frame in enumerate(frames):
+        envelope = lpc_envelope(frame, order, config.frame_size)
+        residual = spectra[i] / np.maximum(envelope, 1e-9)
+        # Bin k should receive whatever used to sit at k / ratio: raising
+        # `ratio` pulls low-frequency envelope detail up into higher bins,
+        # i.e. formants move up.
+        source_positions = np.clip(bin_index / ratio, 0, bins - 1)
+        new_envelope = np.interp(source_positions, bin_index, envelope)
+        warped[i] = residual * new_envelope
+
+    return istft(warped, original_length, config)
+
+
+def shift_voice_character(
+    signal: np.ndarray,
+    semitones: float,
+    formant_ratio: float = 1.0,
+    config: StftConfig = StftConfig(),
+    *,
+    phase_locking: bool = True,
+) -> np.ndarray:
+    """Shift pitch and vocal-tract character independently.
+
+    `pitch_shift` resamples the signal, which is simple but scales formants
+    by the same factor as pitch — the classic "chipmunk/monster" artifact
+    once the offset gets past a couple of semitones, because a real voice
+    can change register without its vocal tract changing size. Here that
+    automatic formant shift is undone with `formant_shift` (dividing out the
+    resample factor) and whichever `formant_ratio` was actually asked for is
+    applied on top. The result: `semitones` controls how high the voice is,
+    `formant_ratio` controls how "big" it sounds, and the two stop fighting.
+    """
+    pitch_factor = 2 ** (semitones / 12) if semitones else 1.0
+    shifted = (
+        pitch_shift(signal, semitones, config, phase_locking=phase_locking)
+        if semitones
+        else np.asarray(signal, dtype=np.float64).copy()
+    )
+    net_formant_ratio = formant_ratio / pitch_factor
+    if abs(net_formant_ratio - 1.0) > 1e-3:
+        shifted = formant_shift(shifted, net_formant_ratio, config)
+    return shifted
 
 
 def _estimate_pitch(signal: np.ndarray, sample_rate: int) -> float | None:
@@ -319,13 +458,48 @@ def _estimate_pitch(signal: np.ndarray, sample_rate: int) -> float | None:
     return float(np.median(candidates)) if candidates else None
 
 
-def voice_character_profile(signal: np.ndarray, sample_rate: int, config: StftConfig = StftConfig()) -> dict[str, float | None]:
-    """Measure broad, non-identifying pitch and brightness traits of a reference."""
+def _average_lpc_envelope(signal: np.ndarray, config: StftConfig, order: int) -> np.ndarray:
+    """Average the LPC spectral envelope across a signal's louder ("voiced") frames.
+
+    Quiet frames (silence, breath) have unreliable autocorrelation and would
+    just average in noise, so frames below 10% of the loudest frame's RMS are
+    skipped when there is enough signal to do so.
+    """
+    frames, _ = _analysis_frames(signal, config)
+    if len(frames) == 0:
+        return np.ones(config.frame_size // 2 + 1)
+    energies = np.sqrt(np.mean(frames**2, axis=1))
+    threshold = 0.1 * energies.max()
+    voiced = frames[energies > threshold] if threshold > 0 else frames
+    if len(voiced) == 0:
+        voiced = frames
+    envelopes = np.stack([lpc_envelope(frame, order, config.frame_size) for frame in voiced])
+    return np.mean(envelopes, axis=0)
+
+
+def voice_character_profile(
+    signal: np.ndarray,
+    sample_rate: int,
+    config: StftConfig = StftConfig(),
+    *,
+    lpc_order: int | None = None,
+) -> dict[str, object]:
+    """Measure broad, non-identifying pitch and vocal-tract traits of a reference.
+
+    `envelope` is the signal's averaged LPC spectral envelope shape — the
+    broad resonant "size" of the voice, used by `match_voice_character` to
+    nudge a source toward a reference without reconstructing its identity.
+    """
+    order = lpc_order or default_lpc_order(sample_rate)
     spectra, _ = stft(signal, config)
     magnitude = np.abs(spectra)
     frequencies = np.linspace(0, 1, magnitude.shape[1])
     centroid = np.sum(magnitude * frequencies, axis=1) / (np.sum(magnitude, axis=1) + 1e-12)
-    return {"pitch_hz": _estimate_pitch(np.asarray(signal), sample_rate), "brightness": float(np.median(centroid))}
+    return {
+        "pitch_hz": _estimate_pitch(np.asarray(signal), sample_rate),
+        "brightness": float(np.median(centroid)),
+        "envelope": _average_lpc_envelope(signal, config, order),
+    }
 
 
 def match_voice_character(
@@ -334,24 +508,54 @@ def match_voice_character(
     reference: np.ndarray,
     reference_rate: int,
     config: StftConfig = StftConfig(),
+    *,
+    envelope_strength: float = 0.7,
 ) -> tuple[np.ndarray, dict[str, float | None]]:
-    """Move a source toward a reference's broad pitch and brightness profile.
+    """Move a source toward a reference's broad pitch and vocal-tract character.
 
-    This is deliberately not voice cloning: it matches aggregate DSP traits,
-    not a person's identity, phonetics, or learned vocal representation.
+    Pitch is matched to the reference's median fundamental with a
+    formant-preserving shift, so the pitch move itself doesn't distort
+    timbre. Separately, each frame's LPC spectral-envelope *shape* is blended
+    `envelope_strength` of the way toward the reference's averaged envelope
+    shape, while that frame's own energy is kept — so loudness and voiced/
+    unvoiced dynamics still follow the source, only the resonance shape
+    leans toward the reference.
+
+    This is deliberately not voice cloning: a single averaged target envelope
+    cannot track the reference's frame-by-frame articulation, only nudge the
+    source's broad resonant character — no learned vocal identity involved.
     """
-    source_profile = voice_character_profile(source, source_rate, config)
-    reference_profile = voice_character_profile(reference, reference_rate, config)
+    order = default_lpc_order(source_rate)
+    source_profile = voice_character_profile(source, source_rate, config, lpc_order=order)
+    reference_profile = voice_character_profile(reference, reference_rate, config, lpc_order=order)
     source_pitch, reference_pitch = source_profile["pitch_hz"], reference_profile["pitch_hz"]
     semitones = 0.0
     if source_pitch and reference_pitch:
         semitones = float(np.clip(12 * np.log2(reference_pitch / source_pitch), -8, 8))
-    matched = pitch_shift(source, semitones, config, phase_locking=True) if semitones else np.asarray(source, dtype=np.float64).copy()
-    spectra, original_length = stft(matched, config)
-    brightness_delta = float(np.clip(reference_profile["brightness"] - source_profile["brightness"], -0.25, 0.25))
-    frequency_axis = np.linspace(-1, 1, spectra.shape[1])
-    # A gentle spectral tilt moves perceived brightness without trying to
-    # reconstruct a target speaker's detailed formant signature.
-    tilt = np.exp(2.5 * brightness_delta * frequency_axis)
-    matched = istft(spectra * tilt, original_length, config)
-    return matched, {"pitch_shift_semitones": semitones, **reference_profile}
+    matched = (
+        shift_voice_character(source, semitones, 1.0, config, phase_locking=True)
+        if semitones
+        else np.asarray(source, dtype=np.float64).copy()
+    )
+
+    frames, original_length = _analysis_frames(matched, config)
+    spectra = np.fft.rfft(frames, axis=1)
+    reference_shape = reference_profile["envelope"]
+    reference_shape = reference_shape / max(float(np.mean(reference_shape)), 1e-9)
+    strength = float(np.clip(envelope_strength, 0.0, 1.0))
+    out = np.empty_like(spectra)
+
+    for i, frame in enumerate(frames):
+        envelope = lpc_envelope(frame, order, config.frame_size)
+        residual = spectra[i] / np.maximum(envelope, 1e-9)
+        gain = float(np.mean(envelope))
+        source_shape = envelope / max(gain, 1e-9)
+        blended_shape = source_shape * (1 - strength) + reference_shape * strength
+        out[i] = residual * (blended_shape * gain)
+
+    matched = istft(out, original_length, config)
+    return matched, {
+        "pitch_shift_semitones": semitones,
+        "pitch_hz": reference_profile["pitch_hz"],
+        "brightness": reference_profile["brightness"],
+    }
