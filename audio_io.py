@@ -58,9 +58,12 @@ def record_mono(seconds: float, sample_rate: int = 44_100) -> tuple[np.ndarray, 
     except ImportError as error:
         raise ValueError("Recording needs sounddevice. Run: py -3 -m pip install sounddevice") from error
     frames = round(seconds * sample_rate)
-    recorded = sd.rec(frames, samplerate=sample_rate, channels=1, dtype="float64")
+    # float64 input streams aren't supported by every sounddevice/PortAudio
+    # build (only float32/int*); record in float32 and widen afterwards so
+    # callers keep getting the float64 arrays the rest of the app expects.
+    recorded = sd.rec(frames, samplerate=sample_rate, channels=1, dtype="float32")
     sd.wait()
-    return recorded[:, 0].copy(), sample_rate
+    return recorded[:, 0].astype(np.float64), sample_rate
 
 
 def play_audio(samples: np.ndarray, sample_rate: int) -> None:
@@ -94,10 +97,12 @@ class Recorder:
                 return
             with self._lock:
                 if self._accepting:
-                    self._chunks.append(indata[:, 0].copy())
+                    self._chunks.append(indata[:, 0].astype(np.float64))
 
         self._accepting = True
-        self._stream = sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float64", callback=callback)
+        # See record_mono() above: float64 streams aren't universally supported,
+        # so record in float32 and widen each chunk to float64 as it arrives.
+        self._stream = sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float32", callback=callback)
         self._stream.start()
 
     def pause(self) -> None:

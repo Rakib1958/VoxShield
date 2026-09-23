@@ -14,7 +14,7 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 import numpy as np
 
@@ -26,6 +26,7 @@ from phase_vocoder import (
 from secure_audio import create_vault, unlock_vault
 from realtime import LiveVoiceChanger, detect_virtual_cable, list_output_devices
 from ml_voice import MLVoiceConverter, capability_report
+from match import identify_song
 
 
 # ---------------------------------------------------------------------------
@@ -182,10 +183,18 @@ class HoverButton(tk.Canvas):
         self.command = command
         self._display = f"{icon}  {text}" if icon else text
 
-        probe = tk.Label(parent, text=self._display, font=F["body_b"])
-        probe.update_idletasks()
-        text_w, text_h = probe.winfo_reqwidth(), probe.winfo_reqheight()
-        probe.destroy()
+        # Measure the label text directly via the font metrics API instead of
+        # creating a throwaway Label and forcing update_idletasks() on it —
+        # that combo was the main cost of building a button (every
+        # update_idletasks() flushes Tk's whole pending event/geometry
+        # queue), and a page with several buttons paid for it several times
+        # over, which is what made switching pages feel glitchy/slow.
+        probe_font = tkfont.Font(font=F["body_b"])
+        # Font.measure()/metrics() give the glyphs' own box, without the ~6px
+        # of built-in padding+border a tk.Label's reqwidth/reqheight used to
+        # include — add it back so buttons keep the same on-screen size.
+        text_w = probe_font.measure(self._display) + 6
+        text_h = probe_font.metrics("linespace") + 6
 
         pad_x, pad_y = 18, 11
         min_w = width * 8 if width else 0
@@ -700,6 +709,12 @@ class VoiceLab(tk.Tk):
         self.live_formant_ratio = tk.DoubleVar(value=1.0)
         self.live_output_device = tk.StringVar(value="Default output device")
 
+        # Recognize (song fingerprint matching) state
+        self.recognize_seconds = tk.IntVar(value=5)
+        self.recognize_recorder: Recorder | None = None
+        self.recognize_audio: tuple | None = None
+        self.recognize_queue: queue.Queue = queue.Queue()
+
         self.nav_buttons: dict[str, NavButton] = {}
         self.active_page: str | None = None
         self.status_label: tk.Label | None = None
@@ -819,7 +834,7 @@ class VoiceLab(tk.Tk):
 
         # nav
         for name, icon in [("Home", "⌂"), ("Transform", "✦"), ("Match", "≈"),
-                           ("Live", "◉"), ("Results", "◫"), ("Vault", "⌁"), ("Compare", "≋"),
+                           ("Live", "◉"), ("Recognize", "♪"), ("Results", "◫"), ("Vault", "⌁"), ("Compare", "≋"),
                            ("Learn", "◌"), ("Settings", "⚙")]:
             nav = NavButton(sidebar, icon, name, lambda n=name: self.show_page(n))
             nav.pack(fill="x", pady=1)
@@ -884,11 +899,40 @@ class VoiceLab(tk.Tk):
         builders = {
             "Home": self._home_page, "Transform": self._transform_page,
             "Match": self._match_page, "Live": self._live_page,
+            "Recognize": self._recognize_page,
             "Results": self._results_page,
             "Vault": self._vault_page, "Compare": self._compare_page,
             "Learn": self._learn_page, "Settings": self._settings_page,
         }
         builders[name]()
+        self._animate_page_reveal()
+
+    def _animate_page_reveal(self, duration_ms: int = 260, steps: int = 16) -> None:
+        """Wipe the freshly built page in top-to-bottom, like it's loading in.
+
+        The page is already fully built and sitting in self.content — this
+        just covers it with an opaque overlay the size of the content area,
+        then shrinks that overlay away from the top edge downward, which
+        progressively reveals the real widgets underneath rather than having
+        them all pop in at once.
+        """
+        overlay = tk.Frame(self.content, bg=C["bg"])
+        overlay.place(x=0, y=0, relwidth=1, relheight=1)
+        overlay.lift()
+        interval = max(1, duration_ms // steps)
+
+        def step(i: int = 0) -> None:
+            if not overlay.winfo_exists():
+                return
+            if i >= steps:
+                overlay.destroy()
+                return
+            t = i / steps
+            eased = 1 - (1 - t) ** 2  # ease-out: fast start, gentle settle
+            overlay.place_configure(rely=eased, relheight=1 - eased)
+            self.after(interval, lambda: step(i + 1))
+
+        step()
 
     def _scroll_page(self) -> tk.Frame:
         """Every page mounts inside one of these — returns the body frame."""
@@ -1516,6 +1560,144 @@ class VoiceLab(tk.Tk):
             self.live_stop_button.set_enabled(False)
         if hasattr(self, "live_status_label") and self.live_status_label.winfo_exists():
             self.live_status_label.configure(text="Stopped.", fg=C["text_dim"])
+
+    # ==================================================================
+    # RECOGNIZE (song fingerprint matching)
+    # ==================================================================
+    def _recognize_page(self) -> None:
+        body = self._scroll_page()
+        self._page_header(
+            body,
+            title="Recognize",
+            subtitle="Record a few seconds near playing music and match it against your fingerprinted library.",
+            eyebrow="RECOGNIZE",
+        )
+
+        card_border, card = make_card(body)
+        card_border.pack(fill="x", padx=42, pady=(0, 20))
+
+        self._section_label(card, "RECORD")
+        rec_row = tk.Frame(card, bg=C["surface"])
+        rec_row.pack(fill="x", padx=22, pady=(6, 4))
+        self.recognize_record_button = HoverButton(
+            rec_row, "Record", command=self._start_recognize_recording,
+            kind="primary", icon="●",
+            tooltip="Record from your default microphone.")
+        self.recognize_record_button.pack(side="left")
+        self.recognize_stop_button = HoverButton(
+            rec_row, "Stop", command=self._stop_recognize_recording,
+            icon="■", tooltip="End the recording early and keep what was captured.")
+        self.recognize_stop_button.pack(side="left", padx=(6, 0))
+        self.recognize_stop_button.set_enabled(False)
+
+        time_row = tk.Frame(card, bg=C["surface"])
+        time_row.pack(fill="x", padx=22, pady=(6, 12))
+        tk.Label(time_row, text="Listen for", bg=C["surface"], fg=C["text_dim"],
+                 font=F["small"]).pack(side="left")
+        seconds_entry = tk.Entry(time_row, textvariable=self.recognize_seconds, width=4,
+                                 bg=C["surface_hi"], fg=C["text"],
+                                 insertbackground=C["text"], relief="flat",
+                                 font=F["mono"], justify="right",
+                                 highlightthickness=1,
+                                 highlightbackground=C["border"],
+                                 highlightcolor=C["accent"])
+        seconds_entry.pack(side="left", padx=(8, 4), ipady=4)
+        Tooltip(seconds_entry, "How many seconds to record before matching.")
+        tk.Label(time_row, text="seconds", bg=C["surface"], fg=C["text_faint"],
+                 font=F["small"]).pack(side="left")
+
+        self.recognize_waveform = WaveformView(card, height=56)
+        self.recognize_waveform.pack(fill="x", padx=22, pady=(0, 14))
+
+        hline(card)
+
+        self._section_label(card, "IDENTIFY")
+        tk.Label(card, text=(
+            "Matches the recording's fingerprint against songs you've ingested "
+            "into the PostgreSQL library (see ingest.py / schema.sql). Requires "
+            "scipy and psycopg2, and a reachable database."
+        ), bg=C["surface"], fg=C["text_dim"], font=F["small"],
+        wraplength=760, justify="left").pack(anchor="w", padx=22, pady=(6, 12))
+
+        action = tk.Frame(card, bg=C["surface"])
+        action.pack(anchor="w", padx=22, pady=(0, 8))
+        self.recognize_match_button = HoverButton(
+            action, "Find match", command=self._start_find_match,
+            kind="solid", icon="♪",
+            tooltip="Fingerprint the recording and look it up in the database.")
+        self.recognize_match_button.pack(side="left")
+        self.recognize_progress = ProgressChip(action)
+        self.recognize_progress.pack(side="left", padx=(14, 0))
+
+        self.recognize_result_label = tk.Label(
+            card, text="No recording yet. Press Record, then Find match.",
+            bg=C["surface"], fg=C["text_faint"], font=F["small"],
+            wraplength=760, justify="left",
+        )
+        self.recognize_result_label.pack(anchor="w", padx=22, pady=(4, 20))
+
+    def _start_recognize_recording(self) -> None:
+        if self.busy or self.recognize_recorder is not None:
+            return
+        try:
+            seconds = int(self.recognize_seconds.get())
+            if seconds <= 0:
+                raise ValueError("Recording duration must be positive")
+        except (tk.TclError, ValueError) as error:
+            messagebox.showerror("Invalid recording length", str(error))
+            return
+        try:
+            self.recognize_recorder = Recorder(self.record_sample_rate.get())
+            self.recognize_recorder.start()
+            self.recognize_record_button.set_enabled(False)
+            self.recognize_stop_button.set_enabled(True)
+            self._set_recognize_status("Recording… listening for the music.")
+            self.after(seconds * 1000, self._auto_stop_recognize_recording)
+        except Exception as error:
+            self.recognize_recorder = None
+            messagebox.showerror("Recording failed", str(error))
+
+    def _auto_stop_recognize_recording(self) -> None:
+        if self.recognize_recorder is not None:
+            self._stop_recognize_recording()
+
+    def _stop_recognize_recording(self) -> None:
+        if self.recognize_recorder is None:
+            return
+        try:
+            samples, sample_rate = self.recognize_recorder.stop()
+            self.recognize_audio = (samples, sample_rate)
+            if hasattr(self, "recognize_waveform") and self.recognize_waveform.winfo_exists():
+                self.recognize_waveform.set_samples(samples)
+            self._set_recognize_status("Recording captured. Press Find match to identify it.")
+        except Exception as error:
+            messagebox.showerror("Recording failed", str(error))
+        finally:
+            self.recognize_recorder = None
+            if hasattr(self, "recognize_record_button") and self.recognize_record_button.winfo_exists():
+                self.recognize_record_button.set_enabled(True)
+            if hasattr(self, "recognize_stop_button") and self.recognize_stop_button.winfo_exists():
+                self.recognize_stop_button.set_enabled(False)
+
+    def _start_find_match(self) -> None:
+        if self.recognize_audio is None:
+            messagebox.showinfo("Nothing recorded", "Record some audio first.")
+            return
+        if hasattr(self, "recognize_progress"):
+            self.recognize_progress.start("Fingerprinting and matching…")
+        threading.Thread(target=self._find_match_worker, args=(self.recognize_audio,), daemon=True).start()
+
+    def _find_match_worker(self, audio: tuple) -> None:
+        samples, sample_rate = audio
+        try:
+            result = identify_song(samples, sample_rate)
+            self.recognize_queue.put((True, result))
+        except Exception as error:
+            self.recognize_queue.put((False, str(error)))
+
+    def _set_recognize_status(self, text: str, color: str | None = None) -> None:
+        if hasattr(self, "recognize_result_label") and self.recognize_result_label.winfo_exists():
+            self.recognize_result_label.configure(text=text, fg=color or C["text_faint"])
 
     # ==================================================================
     # RESULTS
@@ -2629,6 +2811,27 @@ new_spectrum = residual * warped"""),
                     messagebox.showerror("Processing failed", message)
                 elif outputs:
                     self.show_page("Results")
+        except queue.Empty:
+            pass
+
+        try:
+            while True:
+                ok, payload = self.recognize_queue.get_nowait()
+                if hasattr(self, "recognize_progress") and self.recognize_progress.winfo_exists():
+                    self.recognize_progress.stop("Done." if ok else "Failed.", ok=ok)
+                if not ok:
+                    self._set_recognize_status(f"Match failed: {payload}", color=C["danger"])
+                elif payload is None:
+                    self._set_recognize_status("No confident match found.", color=C["text_dim"])
+                else:
+                    result = payload
+                    label = f"Match: '{result.title}'"
+                    if result.artist:
+                        label += f" by {result.artist}"
+                    label += f" (confidence={result.confidence}). Opening in your browser…"
+                    self._set_recognize_status(label, color=C["success"])
+                    import webbrowser
+                    webbrowser.open(result.youtube_url)
         except queue.Empty:
             pass
 
