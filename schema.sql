@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS songs (
 -- One song produces many thousands of rows here, so the table is intentionally
 -- narrow and the (hash_value) index is what makes matching fast.
 CREATE TABLE IF NOT EXISTS hashes (
-    hash_value     INTEGER NOT NULL,
+    hash_value     BIGINT NOT NULL,
     song_id        INTEGER NOT NULL REFERENCES songs(song_id) ON DELETE CASCADE,
     absolute_time  REAL    NOT NULL   -- seconds from the start of the song, at the anchor point
 );

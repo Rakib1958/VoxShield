@@ -6,6 +6,7 @@ Requires: numpy (for DSP modules) and Python's built-in tkinter.
 
 from __future__ import annotations
 
+import math
 import os
 import queue
 import shutil
@@ -809,7 +810,8 @@ class VoiceLab(tk.Tk):
     def _build_shell(self) -> None:
         # SIDEBAR
         sidebar = tk.Frame(self, bg=C["surface"], width=232)
-        sidebar.pack(side="left", fill="y")
+        self._sidebar = sidebar
+        # Not packed: navigation is the feature wheel now (see _open_feature_menu).
         sidebar.pack_propagate(False)
 
         # brand — a slow "breathing" ring behind the glyph is the one purely
@@ -822,7 +824,6 @@ class VoiceLab(tk.Tk):
                                        bd=0, highlightthickness=0)
         self._brand_canvas.pack(side="left", padx=(24, 10))
         self._brand_pulse_phase = 0.0
-        self._animate_brand_pulse()
         wrap = tk.Frame(brand, bg=C["surface"])
         wrap.pack(side="left")
         tk.Label(wrap, text="VOXSHIELD", bg=C["surface"], fg=C["text"],
@@ -834,21 +835,11 @@ class VoiceLab(tk.Tk):
 
         # nav
         for name, icon in [("Home", "⌂"), ("Transform", "✦"), ("Match", "≈"),
-                           ("Live", "◉"), ("Recognize", "♪"), ("Results", "◫"), ("Vault", "⌁"), ("Compare", "≋"),
+                           ("Live", "◉"), ("Recognize", "♪"), ("Vault", "⌁"), ("Compare", "≋"),
                            ("Learn", "◌"), ("Settings", "⚙")]:
             nav = NavButton(sidebar, icon, name, lambda n=name: self.show_page(n))
             nav.pack(fill="x", pady=1)
             self.nav_buttons[name] = nav
-
-        # footer
-        footer = tk.Frame(sidebar, bg=C["surface"])
-        footer.pack(side="bottom", fill="x", pady=20, padx=20)
-        tk.Frame(footer, bg=C["border"], height=1).pack(fill="x", pady=(0, 12))
-        tk.Label(footer, text="🔒  Local processing",
-                 bg=C["surface"], fg=C["text_dim"], font=F["small"]).pack(anchor="w")
-        tk.Label(footer, text="Audio never leaves this computer.",
-                 bg=C["surface"], fg=C["text_faint"], font=F["small"],
-                 justify="left").pack(anchor="w", pady=(2, 0))
 
         # RIGHT COLUMN: content on top, persistent status bar underneath
         wrapper = tk.Frame(self, bg=C["bg"])
@@ -866,7 +857,7 @@ class VoiceLab(tk.Tk):
         self.progress.pack(side="left", padx=16, pady=8)
 
         self.status_label = tk.Label(
-            status_bar, text="Ready. Load a WAV, or record from the mic.",
+            status_bar, text="Ready",
             bg=C["surface"], fg=C["text_dim"], font=F["small"],
         )
         self.status_label.pack(side="right", padx=16)
@@ -890,6 +881,7 @@ class VoiceLab(tk.Tk):
     # Page routing
     # ------------------------------------------------------------------
     def show_page(self, name: str) -> None:
+        self._close_feature_menu()
         self.active_page = name
         for child in self.content.winfo_children():
             child.destroy()
@@ -900,12 +892,31 @@ class VoiceLab(tk.Tk):
             "Home": self._home_page, "Transform": self._transform_page,
             "Match": self._match_page, "Live": self._live_page,
             "Recognize": self._recognize_page,
-            "Results": self._results_page,
             "Vault": self._vault_page, "Compare": self._compare_page,
             "Learn": self._learn_page, "Settings": self._settings_page,
         }
         builders[name]()
         self._animate_page_reveal()
+        if name != "Home":
+            self._add_menu_button()
+
+    def _add_menu_button(self) -> None:
+        """Small round button, top-left of every page, that opens the feature wheel."""
+        btn = tk.Canvas(self.content, width=32, height=32, bg=C["bg"], bd=0,
+                        highlightthickness=0, cursor="hand2")
+        disc = btn.create_oval(2, 2, 30, 30, fill=C["surface_hi"], outline=C["border_hi"])
+        glyph = btn.create_text(16, 16, text="◎", fill=C["accent"], font=("Segoe UI Symbol", 13))
+
+        def hover(on: bool) -> None:
+            btn.itemconfigure(disc, fill=C["accent"] if on else C["surface_hi"])
+            btn.itemconfigure(glyph, fill="#111111" if on else C["accent"])
+
+        btn.bind("<Enter>", lambda _e: hover(True))
+        btn.bind("<Leave>", lambda _e: hover(False))
+        btn.bind("<Button-1>", lambda _e: self._open_feature_menu())
+        Tooltip(btn, "Open the feature wheel")
+        btn.place(x=10, y=8)
+        tk.Misc.lift(btn)
 
     def _animate_page_reveal(self, duration_ms: int = 260, steps: int = 16) -> None:
         """Wipe the freshly built page in top-to-bottom, like it's loading in.
@@ -944,10 +955,9 @@ class VoiceLab(tk.Tk):
                      eyebrow: str = "") -> None:
         head = tk.Frame(parent, bg=C["bg"])
         head.pack(fill="x", padx=42, pady=(34, 22))
-        if eyebrow:
-            tk.Label(head, text=eyebrow, bg=C["bg"], fg=C["accent"],
-                     font=F["eyebrow"]).pack(anchor="w", pady=(0, 6))
-        tk.Label(head, text=title, bg=C["bg"], fg=C["text"],
+        # One heading only, in the accent colour (the `eyebrow` argument is
+        # kept so existing callers don't change, but is no longer drawn).
+        tk.Label(head, text=title, bg=C["bg"], fg=C["accent"],
                  font=F["display"]).pack(anchor="w")
         tk.Label(head, text=subtitle, bg=C["bg"], fg=C["text_dim"],
                  font=F["body"], justify="left").pack(anchor="w", pady=(6, 0))
@@ -965,61 +975,252 @@ class VoiceLab(tk.Tk):
         return inner
 
     # ==================================================================
-    # HOME
+    # HOME — landing page + radial feature menu
     # ==================================================================
+    FEATURES = [
+        ("Transform", "✦", "Pitch and time-stretch a voice"),
+        ("Match", "≈", "Nudge a voice toward a reference"),
+        ("Live", "◉", "Real-time voice changing"),
+        ("Recognize", "♪", "Identify a song from the mic"),
+        ("Vault", "⌁", "Hide audio in a decoy vault"),
+        ("Compare", "≋", "Naive vs phase-vocoder"),
+        ("Learn", "◌", "How the phase vocoder works"),
+        ("Settings", "⚙", "Frame size, hop size and more"),
+    ]
+
     def _home_page(self) -> None:
-        body = self._scroll_page()
-        self._page_header(
-            body,
-            title="Welcome to VoxShield",
-            subtitle="Phase-vocoder pitch and time transformations, entirely on your computer.",
-            eyebrow="OVERVIEW",
-        )
+        land = tk.Canvas(self.content, bg=C["bg"], highlightthickness=0, bd=0)
+        land.pack(fill="both", expand=True)
 
-        # HERO
-        hero_border, hero = make_card(body)
-        hero_border.pack(fill="x", padx=42, pady=(0, 20))
-        hero.configure(padx=0, pady=0)
-        row = tk.Frame(hero, bg=C["surface"])
-        row.pack(fill="x", padx=28, pady=26)
-        left = tk.Frame(row, bg=C["surface"])
-        left.pack(side="left", fill="both", expand=True)
-        tk.Label(left, text="Ready to make your first comparison?",
-                 bg=C["surface"], fg=C["text"], font=F["h1"]).pack(anchor="w")
-        tk.Label(left, text="Load a short spoken WAV in Transform, then generate\n"
-                            "naive, phase-vocoder and phase-locked outputs side by side.",
-                 bg=C["surface"], fg=C["text_dim"], font=F["body"],
-                 justify="left").pack(anchor="w", pady=(6, 16))
-        HoverButton(left, "Open Transform", command=lambda: self.show_page("Transform"),
-                    kind="primary", icon="→",
-                    tooltip="Set up input, pick outputs, and start processing."
-                    ).pack(anchor="w")
+        # Decorative concentric rings on the right, echoing the radial menu:
+        # one dot per feature sits on the middle ring.
+        def draw_rings(_e=None) -> None:
+            land.delete("ring")
+            w, h = land.winfo_width(), land.winfo_height()
+            cx, cy, base = w * 0.76, h * 0.5, min(w, h)
+            for frac, col in ((0.16, C["surface_hi"]), (0.27, C["surface_hi"]), (0.38, C["border"])):
+                r = base * frac
+                land.create_oval(cx - r, cy - r, cx + r, cy + r, outline=col, width=1, tags="ring")
+            r, n = base * 0.27, len(self.FEATURES)
+            for i in range(n):
+                a = -math.pi / 2 + i * 2 * math.pi / n
+                x, y = cx + r * math.cos(a), cy + r * math.sin(a)
+                land.create_oval(x - 4, y - 4, x + 4, y + 4, fill=C["accent_dim"], outline="", tags="ring")
+            land.create_text(cx, cy, text="◈", fill=C["accent"], tags="ring",
+                             font=("Segoe UI Symbol", max(20, int(base * 0.09))))
+        land.bind("<Configure>", draw_rings)
 
-        # STEPS
-        steps = tk.Frame(body, bg=C["bg"])
-        steps.pack(fill="x", padx=42, pady=(0, 20))
-        for i, (title, body_text, tip) in enumerate([
-            ("Choose a voice",  "Use a 16-bit PCM mono WAV. A short spoken sentence is ideal for comparison.",
-             "Click Transform → Choose a file, or use the built-in recorder."),
-            ("Generate variants", "Create naive, phase-vocoder and phase-locked transformations in one run.",
-             "Uncheck any variant you don't need to save time on long clips."),
-            ("Listen critically", "Compare sustained vowels, consonants, pitch, timing and audible artifacts.",
-             "Use Results to A/B the outputs and Save the ones you want to keep."),
-        ]):
-            steps.columnconfigure(i, weight=1, uniform="step")
-            border, card = make_card(steps)
-            border.grid(row=0, column=i, sticky="nsew", padx=6)
-            body_frame = tk.Frame(card, bg=C["surface"], padx=18, pady=16)
-            body_frame.pack(fill="both", expand=True)
+        text = tk.Frame(land, bg=C["bg"])
+        text.place(relx=0.07, rely=0.5, anchor="w")
+        tk.Label(text, text="PHASE VOCODER STUDIO", bg=C["bg"], fg=C["accent"],
+                 font=("Segoe UI Semibold", 10)).pack(anchor="w")
+        tk.Label(text, text="VoxShield", bg=C["bg"], fg=C["text"],
+                 font=("Segoe UI Semibold", 60)).pack(anchor="w", pady=(2, 0))
+        tk.Label(text, text="Reshape, protect and recognize voices.", bg=C["bg"],
+                 fg=C["accent"], font=("Segoe UI Semibold", 18)).pack(anchor="w", pady=(0, 14))
+        tk.Label(text, text=(
+            "VoxShield uses a phase vocoder to change pitch and timing without the "
+            "chipmunk effect. Match a reference voice, change your voice live during "
+            "calls, lock audio inside a decoy vault, or identify a song from the mic — "
+            "all running on your own computer."
+        ), bg=C["bg"], fg=C["text_dim"], font=("Segoe UI", 11), wraplength=520,
+            justify="left").pack(anchor="w", pady=(0, 26))
 
-            step_num = tk.Label(body_frame, text=f"0{i+1}",
-                                bg=C["surface"], fg=C["accent"], font=F["mono_b"])
-            step_num.pack(anchor="w")
-            tk.Label(body_frame, text=title, bg=C["surface"], fg=C["text"],
-                     font=F["h2"]).pack(anchor="w", pady=(6, 6))
-            tk.Label(body_frame, text=body_text, bg=C["surface"], fg=C["text_dim"],
-                     font=F["small"], wraplength=240, justify="left").pack(anchor="w")
-            Tooltip(border, tip)
+        row = tk.Frame(text, bg=C["bg"])
+        row.pack(anchor="w")
+        HoverButton(row, "Explore features", command=self._open_feature_menu,
+                    kind="primary", icon="◎",
+                    tooltip="Open the feature wheel.").pack(side="left")
+        HoverButton(row, "How it works", command=lambda: self.show_page("Learn"),
+                    kind="solid", icon="◌",
+                    tooltip="A guided look at the phase vocoder.").pack(side="left", padx=(10, 0))
+
+
+    # --- radial feature menu ---------------------------------------------
+    _MENU_NODE_R = 34
+    _MENU_HUB_R = 74
+
+    def _blurred_backdrop(self, w: int, h: int):
+        """Screenshot the content area, blur and darken it. None if Pillow or
+        screen capture is unavailable — the menu then just uses a plain dark
+        backdrop."""
+        try:
+            from PIL import Image, ImageFilter, ImageGrab, ImageTk  # type: ignore[import-not-found]
+            self.update()
+            # Tk reports "logical" pixels but the screen grab is in physical
+            # ones; on a scaled display (e.g. 125%) they differ, so measure the
+            # ratio once and convert the capture box.
+            if getattr(self, "_grab_scale", None) is None:
+                self._grab_scale = ImageGrab.grab().size[0] / self.winfo_screenwidth()
+            k = self._grab_scale
+            x, y = self.content.winfo_rootx(), self.content.winfo_rooty()
+            shot = ImageGrab.grab(bbox=(round(x * k), round(y * k),
+                                        round((x + w) * k), round((y + h) * k))).convert("RGB")
+            if shot.size != (w, h):
+                shot = shot.resize((w, h))
+            shot = shot.filter(ImageFilter.GaussianBlur(10))
+            shot = Image.blend(shot, Image.new("RGB", shot.size, C["bg"]), 0.5)
+            return ImageTk.PhotoImage(shot)
+        except Exception:
+            return None
+
+    def _open_feature_menu(self) -> None:
+        existing = getattr(self, "_menu_canvas", None)
+        if existing is not None and existing.winfo_exists():
+            return
+        self.update_idletasks()
+        w, h = self.content.winfo_width(), self.content.winfo_height()
+        photo = self._blurred_backdrop(w, h)  # must be grabbed before the canvas covers the page
+        self._menu_items = list(self.FEATURES)
+        if self.active_page != "Home":
+            self._menu_items.insert(0, ("Home", "⌂", "Back to the landing page"))
+
+        canvas = tk.Canvas(self.content, bg=C["bg"], highlightthickness=0, bd=0)
+        canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        tk.Misc.lift(canvas)  # Canvas.lift() raises canvas items, not the widget
+        self._menu_canvas, self._menu_photo = canvas, photo
+        if photo is not None:
+            canvas.create_image(0, 0, image=photo, anchor="nw")
+
+        canvas.create_oval(0, 0, 0, 0, outline=C["border_hi"], dash=(3, 5), tags="ring")
+        canvas.create_oval(0, 0, 0, 0, fill=C["surface"], outline=C["border_hi"], tags="hub")
+        canvas.create_text(0, 0, text="◈", fill=C["accent"], tags="hub_icon",
+                           font=("Segoe UI Symbol", 22))
+        canvas.create_text(0, 0, text="VoxShield", fill=C["text"], tags="hub_title", font=F["h2"])
+        canvas.create_text(0, 0, text="Choose a feature", fill=C["text_dim"], tags="hub_sub",
+                           font=F["small"], width=124, justify="center")
+
+        n = len(self._menu_items)
+        for i, (name, icon, _desc) in enumerate(self._menu_items):
+            a = -math.pi / 2 + i * 2 * math.pi / n
+            s, c_ = math.sin(a), math.cos(a)
+            anchor = "s" if s < -0.5 else "n" if s > 0.5 else ("w" if c_ > 0 else "e")
+            here = name == self.active_page  # mark the page you're currently on
+            canvas.create_oval(0, 0, 0, 0, fill=C["surface_hi"],
+                               outline=C["accent_dim"] if here else C["border_hi"],
+                               width=2 if here else 1, tags=(f"n{i}", "node"))
+            canvas.create_text(0, 0, text=icon, fill=C["text"], font=("Segoe UI Symbol", 18),
+                               tags=(f"n{i}i", "nodeicon"))
+            canvas.create_text(0, 0, text=name, fill=C["text"], font=F["body_b"], anchor=anchor,
+                               state="hidden", tags=(f"n{i}l", "label"))
+        canvas.create_oval(0, 0, 0, 0, fill=C["surface_hi"], outline=C["border_hi"], tags="close")
+        canvas.create_text(0, 0, text="✕", fill=C["text_dim"], font=("Segoe UI Symbol", 11),
+                           tags="close_icon")
+
+        self._menu = {"hover": None, "ready": False, "pos": [], "close": (0, 0)}
+        canvas.bind("<Motion>", self._on_menu_motion)
+        canvas.bind("<Leave>", lambda _e: self._set_menu_hover(None))
+        canvas.bind("<Button-1>", self._on_menu_click)
+        canvas.bind("<Configure>", lambda _e: self._menu["ready"] and self._layout_menu(1.0))
+        self._menu_escape = self.bind("<Escape>", lambda _e: self._close_feature_menu(), "+")
+        self._animate_menu_open()
+
+    def _layout_menu(self, eased: float) -> None:
+        c = getattr(self, "_menu_canvas", None)
+        if c is None or not c.winfo_exists():
+            return
+        w, h = c.winfo_width(), c.winfo_height()
+        cx, cy = w / 2, h / 2
+        r, hub_r = self._MENU_NODE_R, self._MENU_HUB_R
+        radius = max(120, min(w * 0.36, h / 2 - 88, 240))
+        ring = radius * eased
+        c.coords("ring", cx - ring, cy - ring, cx + ring, cy + ring)
+        c.coords("hub", cx - hub_r, cy - hub_r, cx + hub_r, cy + hub_r)
+        c.coords("hub_icon", cx, cy - 28)
+        c.coords("hub_title", cx, cy + 2)
+        c.coords("hub_sub", cx, cy + 28)
+
+        n = len(self._menu_items)
+        pos = []
+        for i in range(n):
+            a = -math.pi / 2 + i * 2 * math.pi / n
+            x, y = cx + ring * math.cos(a), cy + ring * math.sin(a)
+            rr = r * (0.5 + 0.5 * eased)
+            c.coords(f"n{i}", x - rr, y - rr, x + rr, y + rr)
+            c.coords(f"n{i}i", x, y)
+            off = ring + r + 12
+            c.coords(f"n{i}l", cx + off * math.cos(a), cy + off * math.sin(a))
+            pos.append((x, y))
+        bx, by = w - 44, 44
+        c.coords("close", bx - 16, by - 16, bx + 16, by + 16)
+        c.coords("close_icon", bx, by)
+        self._menu["pos"], self._menu["close"] = pos, (bx, by)
+
+    def _animate_menu_open(self, i: int = 0, steps: int = 20) -> None:
+        c = getattr(self, "_menu_canvas", None)
+        if c is None or not c.winfo_exists():
+            return
+        t = min(1.0, i / steps)
+        self._layout_menu(1 - (1 - t) ** 3)  # ease-out: nodes fly out then settle
+        if i >= steps:
+            c.itemconfigure("label", state="normal")
+            self._menu["ready"] = True
+            return
+        self.after(14, lambda: self._animate_menu_open(i + 1, steps))
+
+    def _menu_hit(self, x: float, y: float):
+        m = self._menu
+        for i, (px, py) in enumerate(m["pos"]):
+            if math.hypot(x - px, y - py) <= self._MENU_NODE_R + 6:
+                return i
+        bx, by = m["close"]
+        if math.hypot(x - bx, y - by) <= 20:
+            return "close"
+        return None
+
+    def _on_menu_motion(self, event) -> None:
+        if self._menu["ready"]:
+            self._set_menu_hover(self._menu_hit(event.x, event.y))
+
+    def _set_menu_hover(self, target) -> None:
+        m, c = self._menu, self._menu_canvas
+        if not m["ready"] or target == m["hover"] or not c.winfo_exists():
+            return
+        prev = m["hover"]
+        if isinstance(prev, int):
+            c.itemconfigure(f"n{prev}", fill=C["surface_hi"],
+                            outline=C["accent_dim"] if self._menu_items[prev][0] == self.active_page else C["border_hi"])
+            c.itemconfigure(f"n{prev}i", fill=C["text"])
+            c.itemconfigure(f"n{prev}l", fill=C["text"])
+        m["hover"] = target
+        if isinstance(target, int):
+            name, _icon, desc = self._menu_items[target]
+            c.itemconfigure(f"n{target}", fill=C["accent"], outline=C["accent_hi"])
+            c.itemconfigure(f"n{target}i", fill="#111111")
+            c.itemconfigure(f"n{target}l", fill=C["accent"])
+            c.itemconfigure("hub_title", text=name)
+            c.itemconfigure("hub_sub", text=desc)
+        else:
+            c.itemconfigure("hub_title", text="VoxShield")
+            c.itemconfigure("hub_sub", text="Choose a feature")
+        c.configure(cursor="hand2" if target is not None else "arrow")
+
+    def _on_menu_click(self, event) -> None:
+        if not self._menu["ready"]:
+            return
+        target = self._menu_hit(event.x, event.y)
+        if isinstance(target, int):
+            name = self._menu_items[target][0]
+            self._close_feature_menu()
+            self.show_page(name)
+        elif target == "close":
+            self._close_feature_menu()
+        else:
+            c = self._menu_canvas
+            cx, cy = c.winfo_width() / 2, c.winfo_height() / 2
+            if math.hypot(event.x - cx, event.y - cy) > self._MENU_HUB_R:
+                self._close_feature_menu()  # click on the backdrop dismisses it
+
+    def _close_feature_menu(self) -> None:
+        c = getattr(self, "_menu_canvas", None)
+        if c is not None and c.winfo_exists():
+            c.destroy()
+        self._menu_canvas = None
+        self._menu_photo = None
+        escape = getattr(self, "_menu_escape", None)
+        if escape:
+            self.unbind("<Escape>", escape)
+            self._menu_escape = None
 
     # ==================================================================
     # TRANSFORM
@@ -1186,7 +1387,7 @@ class VoiceLab(tk.Tk):
         Tooltip(age_scale, "Only affects Feminine-style and Masculine-style presets — re-applies that "
                            "preset's pitch/formant at the new age.")
 
-        ttk.Checkbutton(right, text="Attempt background-music reduction (experimental)",
+        ttk.Checkbutton(right, text="Reduce background music",
                         variable=self.remove_background).pack(anchor="w", padx=22, pady=(14, 8))
 
         self._section_label(right, "OUTPUTS TO WRITE")
@@ -1221,6 +1422,8 @@ class VoiceLab(tk.Tk):
         self.transform_progress = ProgressChip(action)
         self.transform_progress.pack(side="left", padx=(14, 0))
 
+        self._results_section(body)
+
     def _section_label(self, parent, text: str) -> None:
         wrap = tk.Frame(parent, bg=C["surface"])
         wrap.pack(fill="x", padx=22, pady=(16, 0))
@@ -1250,7 +1453,7 @@ class VoiceLab(tk.Tk):
         self._page_header(
             body,
             title="Reference-guided match",
-            subtitle="Match broad pitch and brightness traits from a permitted reference. This is not voice cloning.",
+            subtitle="Shift a voice toward the pitch and tone of a reference recording.",
             eyebrow="MATCH",
         )
 
@@ -1266,23 +1469,12 @@ class VoiceLab(tk.Tk):
         self._section_label(card, "REFERENCE VOICE")
         self._path_row(card, self.match_reference_path,
                        lambda: self._choose_vault_file(self.match_reference_path),
-                       "Use only audio you have permission to use.",
+                       "The recording to match against.",
                        "Pick the reference voice file.")
 
+        self._section_label(card, "ML VOICE MATCHING")
         tk.Label(card, text=(
-            "The matcher estimates the reference's median pitch and its averaged LPC spectral "
-            "envelope (a lightweight model of vocal-tract resonance), then applies a "
-            "formant-preserving pitch shift and blends the source's own envelope shape toward "
-            "the reference's.\nIt cannot copy vocal identity — only nudge the source toward the "
-            "reference's general register and resonant character."
-        ), bg=C["surface"], fg=C["text_dim"], font=F["small"],
-        wraplength=760, justify="left").pack(anchor="w", padx=22, pady=(6, 14))
-
-        self._section_label(card, "ML VOICE MATCHING (EXPERIMENTAL)")
-        tk.Label(card, text=(
-            "An optional neural alternative (kNN-VC) that sounds considerably closer to the reference "
-            "than the LPC matcher above — at the cost of PyTorch, a one-time model download over the "
-            "internet, and real compute per conversion. Check your device before turning it on."
+            "Neural voice conversion (kNN-VC). Requires PyTorch and a one-time model download."
         ), bg=C["surface"], fg=C["text_dim"], font=F["small"],
         wraplength=760, justify="left").pack(anchor="w", padx=22, pady=(4, 8))
 
@@ -1296,7 +1488,7 @@ class VoiceLab(tk.Tk):
                     ).pack(side="left", padx=(10, 0))
 
         self.ml_capability_label = tk.Label(
-            card, text="Not checked yet. Press \"Check my device\" before enabling this.",
+            card, text="",
             bg=C["surface"], fg=C["text_faint"], font=F["small"], wraplength=760, justify="left",
         )
         self.ml_capability_label.pack(anchor="w", padx=22, pady=(6, 14))
@@ -1308,10 +1500,12 @@ class VoiceLab(tk.Tk):
                     tooltip="Render a quick preview and play it back.").pack(side="left")
         HoverButton(action, "Render to file", command=lambda: self._start_match(preview=False),
                     kind="primary", icon="✦",
-                    tooltip="Render the match into a temporary WAV in Results."
+                    tooltip="Render the match into a temporary WAV."
                     ).pack(side="left", padx=(8, 0))
         self.match_progress = ProgressChip(action)
         self.match_progress.pack(side="left", padx=(14, 0))
+
+        self._results_section(body)
 
     def _check_ml_capability(self) -> None:
         duration_seconds = 8.0
@@ -1347,28 +1541,12 @@ class VoiceLab(tk.Tk):
             body,
             title="Live",
             subtitle="Apply pitch and formant shifting to your microphone in near real time.",
-            eyebrow="LIVE · EXPERIMENTAL",
+            eyebrow="LIVE",
         )
-
-        note_border, note = make_card(body)
-        note_border.pack(fill="x", padx=42, pady=(0, 16))
-        wrap = tk.Frame(note, bg=C["surface"])
-        wrap.pack(fill="x", padx=22, pady=16)
-        tk.Label(wrap, text="How this differs from Transform", bg=C["surface"],
-                 fg=C["text"], font=F["h2"]).pack(anchor="w")
-        tk.Label(wrap, text=(
-            "Transform processes a whole recording at once. Live instead chops the microphone feed into short "
-            "overlapping blocks, runs each one through the same pitch/formant pipeline, and crossfades them back "
-            "together — trading a bit of latency (about one block, shown below) for something you can talk "
-            "through live. To use this inside a call app (Zoom, Discord, Meet…), install a virtual audio cable "
-            "(e.g. VB-CABLE on Windows), pick it as the output device below, then select that same cable as the "
-            "microphone inside the call app."
-        ), bg=C["surface"], fg=C["text_dim"], font=F["body"], wraplength=800,
-        justify="left").pack(anchor="w", pady=(6, 0))
 
         call_border, call = make_card(body)
         call_border.pack(fill="x", padx=42, pady=(0, 16))
-        self._section_label(call, "CALL ROUTING · WHATSAPP, MESSENGER, DISCORD, ZOOM…")
+        self._section_label(call, "CALL ROUTING")
         self.call_status_label = tk.Label(
             call, text="Checking for a virtual audio cable…",
             bg=C["surface"], fg=C["text_dim"], font=F["body"], wraplength=800, justify="left",
@@ -1470,9 +1648,7 @@ class VoiceLab(tk.Tk):
             _, name = cable
             if has_label:
                 self.call_status_label.configure(
-                    text=(f"✓ Found a virtual audio cable: \"{name}\". Press \"Start call mode\", then in "
-                          f"WhatsApp/Messenger/Discord's call settings, set the microphone to \"{name}\" — "
-                          f"they'll hear the shifted voice instead of your real mic."),
+                    text=f"✓ Virtual audio cable found: \"{name}\". Set it as the microphone in your call app.",
                     fg=C["success"],
                 )
             if has_button:
@@ -1480,11 +1656,7 @@ class VoiceLab(tk.Tk):
         else:
             if has_label:
                 self.call_status_label.configure(
-                    text=("No virtual audio cable detected. These apps can't accept audio from another "
-                          "program directly — install a free one (search \"VB-CABLE\", vb-audio.com; or "
-                          "VoiceMeeter for more routing options), then press Rescan. It installs a virtual "
-                          "microphone/speaker pair: this app plays the shifted voice into it, and the call "
-                          "app picks it up as if it were a real microphone."),
+                    text="No virtual audio cable detected. Install one (for example VB-CABLE), then press Rescan.",
                     fg=C["text_dim"],
                 )
             if has_button:
@@ -1569,7 +1741,7 @@ class VoiceLab(tk.Tk):
         self._page_header(
             body,
             title="Recognize",
-            subtitle="Record a few seconds near playing music and match it against your fingerprinted library.",
+            subtitle="Identify a song from a short recording.",
             eyebrow="RECOGNIZE",
         )
 
@@ -1612,13 +1784,6 @@ class VoiceLab(tk.Tk):
         hline(card)
 
         self._section_label(card, "IDENTIFY")
-        tk.Label(card, text=(
-            "Matches the recording's fingerprint against songs you've ingested "
-            "into the PostgreSQL library (see ingest.py / schema.sql). Requires "
-            "scipy and psycopg2, and a reachable database."
-        ), bg=C["surface"], fg=C["text_dim"], font=F["small"],
-        wraplength=760, justify="left").pack(anchor="w", padx=22, pady=(6, 12))
-
         action = tk.Frame(card, bg=C["surface"])
         action.pack(anchor="w", padx=22, pady=(0, 8))
         self.recognize_match_button = HoverButton(
@@ -1630,7 +1795,7 @@ class VoiceLab(tk.Tk):
         self.recognize_progress.pack(side="left", padx=(14, 0))
 
         self.recognize_result_label = tk.Label(
-            card, text="No recording yet. Press Record, then Find match.",
+            card, text="",
             bg=C["surface"], fg=C["text_faint"], font=F["small"],
             wraplength=760, justify="left",
         )
@@ -1702,20 +1867,22 @@ class VoiceLab(tk.Tk):
     # ==================================================================
     # RESULTS
     # ==================================================================
-    def _results_page(self) -> None:
-        body = self._scroll_page()
-        self._page_header(
-            body,
-            title="Temporary results",
-            subtitle="Nothing here is final. Save only the versions you want to keep; delete the rest.",
-            eyebrow="RESULTS",
-        )
+    def _results_section(self, parent) -> None:
+        """Inline results listing embedded at the bottom of feature pages."""
+        if not self.result_files:
+            return
 
-        # PLAYBACK CONTROLS
-        ctrl_border, ctrl = make_card(body)
-        ctrl_border.pack(fill="x", padx=42, pady=(0, 14))
+        tk.Frame(parent, bg=C["border"], height=1).pack(fill="x", padx=42, pady=(20, 0))
+
+        header = tk.Frame(parent, bg=C["bg"])
+        header.pack(fill="x", padx=42, pady=(14, 0))
+        tk.Label(header, text="Temporary outputs", bg=C["bg"], fg=C["accent"],
+                 font=F["h2"]).pack(side="left")
+
+        ctrl_border, ctrl = make_card(parent)
+        ctrl_border.pack(fill="x", padx=42, pady=(10, 8))
         row = tk.Frame(ctrl, bg=C["surface"])
-        row.pack(fill="x", padx=22, pady=16)
+        row.pack(fill="x", padx=22, pady=12)
         tk.Label(row, text="Volume", bg=C["surface"], fg=C["text"],
                  font=F["body_b"]).pack(side="left")
         vol_scale = ttk.Scale(row, from_=0, to=2, variable=self.volume,
@@ -1730,19 +1897,8 @@ class VoiceLab(tk.Tk):
         HoverButton(row, "Stop", command=self._stop_playback, icon="■",
                     tooltip="Stop playback entirely.").pack(side="left", padx=(6, 0))
 
-        # RESULT ROWS
-        list_area = tk.Frame(body, bg=C["bg"])
+        list_area = tk.Frame(parent, bg=C["bg"])
         list_area.pack(fill="both", expand=True, padx=42, pady=(0, 30))
-        if not self.result_files:
-            empty_border, empty = make_card(list_area)
-            empty_border.pack(fill="x")
-            tk.Label(empty, text="◫", bg=C["surface"], fg=C["text_faint"],
-                     font=F["icon_lg"]).pack(pady=(28, 8))
-            tk.Label(empty, text="No temporary outputs yet",
-                     bg=C["surface"], fg=C["text"], font=F["h2"]).pack()
-            tk.Label(empty, text="Generate audio from the Transform page to see results here.",
-                     bg=C["surface"], fg=C["text_dim"], font=F["small"]).pack(pady=(4, 28))
-            return
 
         for path in list(self.result_files):
             if not path.is_file():
@@ -1752,11 +1908,9 @@ class VoiceLab(tk.Tk):
             row_body = tk.Frame(row_card, bg=C["surface"])
             row_body.pack(fill="x", padx=18, pady=12)
 
-            # icon
             tk.Label(row_body, text="♪", bg=C["surface"], fg=C["accent"],
                      font=F["icon_lg"]).pack(side="left", padx=(0, 14))
 
-            # name + parent
             name_wrap = tk.Frame(row_body, bg=C["surface"])
             name_wrap.pack(side="left", fill="x", expand=True)
             tk.Label(name_wrap, text=path.name, bg=C["surface"], fg=C["text"],
@@ -1765,7 +1919,6 @@ class VoiceLab(tk.Tk):
                      bg=C["surface"], fg=C["text_faint"],
                      font=F["small"]).pack(anchor="w", pady=(2, 0))
 
-            # actions
             HoverButton(row_body, "Save as…", command=lambda p=path: self._save_result(p),
                         kind="primary", icon="⤓",
                         tooltip="Save this file to a permanent location."
@@ -1850,13 +2003,15 @@ class VoiceLab(tk.Tk):
 
         HoverButton(unlock, "Unlock to temporary audio",
                     command=self._unlock_vault, kind="primary", icon="🔓",
-                    tooltip="Decode the hidden clip and add it to Results."
+                    tooltip="Decode the hidden clip into a temporary file."
                     ).pack(anchor="w", padx=22, pady=(0, 12))
         tk.Label(unlock, text=(
             "The passphrase is never stored inside the vault. Keep it separately; "
             "the decoy is visible by design and is not the secret."
         ), bg=C["surface"], fg=C["text_faint"], font=F["small"],
         wraplength=340, justify="left").pack(anchor="w", padx=22, pady=(0, 20))
+
+        self._results_section(body)
 
     def _path_row_light(self, parent, variable, command) -> None:
         row = tk.Frame(parent, bg=C["surface"])
@@ -2286,7 +2441,7 @@ new_spectrum = residual * warped"""),
         self.use_ml_matching.set(False)
         if hasattr(self, "ml_capability_label") and self.ml_capability_label.winfo_exists():
             self.ml_capability_label.configure(
-                text="Not checked yet. Press \"Check my device\" before enabling this.",
+                text="",
                 fg=C["text_faint"],
             )
         self._update_values()
@@ -2521,7 +2676,7 @@ new_spectrum = residual * warped"""),
             else:
                 samples, sample_rate = real_input
             create_vault(samples, sample_rate, decoy, passphrase, destination)
-            self.result_queue.put((True, "Created a temporary decoy vault. Save it from Results when ready.", [destination]))
+            self.result_queue.put((True, "Created a temporary decoy vault. Save it when ready.", [destination]))
         except Exception as error:
             self.result_queue.put((False, str(error), []))
 
@@ -2541,7 +2696,7 @@ new_spectrum = residual * warped"""),
         try:
             samples, sample_rate = unlock_vault(vault, passphrase)
             write_output_wav(destination, samples, sample_rate)
-            self.result_queue.put((True, "Unlocked audio to a temporary file. Review or save it from Results.", [destination]))
+            self.result_queue.put((True, "Unlocked audio to a temporary file. Review or save it below.", [destination]))
         except Exception as error:
             self.result_queue.put((False, str(error), []))
 
@@ -2577,7 +2732,7 @@ new_spectrum = residual * warped"""),
         self._stop_playback()
         path.unlink()
         self.result_files = [item for item in self.result_files if item != path]
-        self.show_page("Results")
+        self.show_page(self.active_page)
 
     def _recover_temp_outputs(self) -> None:
         old_dirs = [p for p in self.temp_root.iterdir()
@@ -2810,7 +2965,7 @@ new_spectrum = residual * warped"""),
                 if not ok:
                     messagebox.showerror("Processing failed", message)
                 elif outputs:
-                    self.show_page("Results")
+                    self.show_page(self.active_page)
         except queue.Empty:
             pass
 
